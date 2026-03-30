@@ -340,6 +340,27 @@ fn add_benchmark(c: &mut Criterion) {
             },
         );
     }
+
+    // pure scatter benchmark: all length-1 ranges, models fully interleaved merge
+    let num_arrays = 3;
+    let scatter_arrays: Vec<_> = (0..num_arrays)
+        .map(|_| create_primitive_array::<Int32Type>(8192, 0.))
+        .collect();
+    let scatter_refs: Vec<&dyn Array> = scatter_arrays.iter().map(|a| a as &dyn Array).collect();
+    let num_rows = 8192;
+    let pure_scatter_ranges: Vec<(usize, Range<usize>)> = (0..num_rows)
+        .map(|i| (i % num_arrays, (i / num_arrays)..(i / num_arrays) + 1))
+        .collect();
+    let pure_scatter_indices: Vec<(usize, usize)> = (0..num_rows)
+        .map(|i| (i % num_arrays, i / num_arrays))
+        .collect();
+
+    c.bench_function("pure_scatter_ranges i32 8192", |b| {
+        b.iter(|| hint::black_box(interleave_ranges(&scatter_refs, &pure_scatter_ranges).unwrap()))
+    });
+    c.bench_function("pure_scatter_indices i32 8192", |b| {
+        b.iter(|| hint::black_box(interleave(&scatter_refs, &pure_scatter_indices).unwrap()))
+    });
 }
 
 criterion_group!(benches, add_benchmark);
