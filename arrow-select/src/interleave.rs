@@ -574,8 +574,8 @@ fn interleave_fallback_dictionary<K: ArrowDictionaryKeyType>(
 ///
 /// Each element in `ranges` is a `(array_index, row_range)` pair identifying
 /// a contiguous slice of rows from one of the input arrays. This is more
-/// efficient than [`interleave`] when the caller already knows the ranges,
-/// as it avoids per-element indexing in favor of bulk copies.
+/// efficient than [`interleave`] when selecting contiguous runs of rows,
+/// as it can bulk-copy data (memcpy) rather than copying element by element.
 ///
 /// ```text
 /// ┌─────────────────┐      ┌───────────┐                     ┌─────────────────┐
