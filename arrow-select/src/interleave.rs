@@ -27,11 +27,18 @@ use arrow_buffer::{ArrowNativeType, BooleanBuffer, MutableBuffer, NullBuffer, Of
 use arrow_data::ByteView;
 use arrow_data::transform::MutableArrayData;
 use arrow_schema::{ArrowError, DataType, FieldRef, Fields};
+use std::ops::Range;
 use std::sync::Arc;
 
 macro_rules! primitive_helper {
     ($t:ty, $values:ident, $indices:ident, $data_type:ident) => {
         interleave_primitive::<$t>($values, $indices, $data_type)
+    };
+}
+
+macro_rules! primitive_ranges_helper {
+    ($t:ty, $values:ident, $ranges:ident, $data_type:ident) => {
+        interleave_primitive_ranges::<$t>($values, $ranges, $data_type)
     };
 }
 
@@ -145,6 +152,54 @@ impl<'a, T: Array + 'static> Interleave<'a, T> {
         };
 
         Self { arrays, nulls }
+    }
+}
+
+/// Common functionality for range-based interleaving
+struct InterleaveRanges<'a, T> {
+    arrays: Vec<&'a T>,
+    nulls: Option<NullBuffer>,
+    len: usize,
+}
+
+impl<'a, T: Array + 'static> InterleaveRanges<'a, T> {
+    fn new(values: &[&'a dyn Array], ranges: &[(usize, Range<usize>)]) -> Self {
+        let mut has_nulls = false;
+        let arrays: Vec<&T> = values
+            .iter()
+            .map(|x| {
+                has_nulls = has_nulls || x.null_count() != 0;
+                x.as_any().downcast_ref().unwrap()
+            })
+            .collect();
+
+        let len: usize = ranges.iter().map(|(_, r)| r.len()).sum();
+        let nulls = match has_nulls {
+            true => {
+                let mut builder = BooleanBufferBuilder::new(len);
+                for &(array_idx, ref range) in ranges {
+                    match arrays[array_idx].nulls() {
+                        None => builder.append_n(range.len(), true),
+                        Some(null_buf) => {
+                            let bool_buf = null_buf.inner();
+                            builder.append_packed_range(
+                                bool_buf.offset() + range.start..bool_buf.offset() + range.end,
+                                bool_buf.values(),
+                            );
+                        }
+                    }
+                }
+                let buf = NullBuffer::new(builder.finish());
+                if buf.null_count() == 0 {
+                    None
+                } else {
+                    Some(buf)
+                }
+            }
+            false => None,
+        };
+
+        Self { arrays, nulls, len }
     }
 }
 
@@ -513,6 +568,385 @@ fn interleave_fallback_dictionary<K: ArrowDictionaryKeyType>(
     // SAFETY: keys_array is constructed from a valid set of keys.
     let array = unsafe { DictionaryArray::new_unchecked(keys_array, concatenated_values) };
     Ok(Arc::new(array))
+}
+
+/// Takes contiguous ranges from a list of [`Array`], creating a new [`Array`] from those values.
+///
+/// Each element in `ranges` is a `(array_index, row_range)` pair identifying
+/// a contiguous slice of rows from one of the input arrays. This is more
+/// efficient than [`interleave`] when the caller already knows the ranges,
+/// as it avoids per-element indexing in favor of bulk copies.
+///
+/// ```text
+/// ┌─────────────────┐      ┌───────────┐                     ┌─────────────────┐
+/// │        A        │      │ (0, 0..2) │  interleave_ranges( │        A        │
+/// ├─────────────────┤      ├───────────┤    [v0, v1],        ├─────────────────┤
+/// │        D        │      │ (1, 0..2) │    ranges           │        D        │
+/// └─────────────────┘      └───────────┘  )                  ├─────────────────┤
+///   values array 0           ranges     ──────────────────▶  │        B        │
+///                                                            ├─────────────────┤
+/// ┌─────────────────┐                                        │        C        │
+/// │        B        │                                        └─────────────────┘
+/// ├─────────────────┤                                          result
+/// │        C        │
+/// ├─────────────────┤
+/// │        E        │
+/// └─────────────────┘
+///   values array 1
+/// ```
+///
+/// # Example
+/// ```
+/// # use arrow_array::{Int32Array, cast::AsArray, types::Int32Type};
+/// # use arrow_select::interleave::interleave_ranges;
+///
+/// let a = Int32Array::from(vec![1, 2, 3, 4]);
+/// let b = Int32Array::from(vec![5, 6, 7]);
+/// let result = interleave_ranges(&[&a, &b], &[(0, 0..3), (1, 0..2)]).unwrap();
+/// let v = result.as_primitive::<Int32Type>();
+/// assert_eq!(v.values(), &[1, 2, 3, 5, 6]);
+/// ```
+///
+/// For selecting individual elements see [`interleave`]
+///
+/// # Panics
+///
+/// Panics if any `array_index` in `ranges` is out of bounds for `values`,
+/// or if any `row_range` extends beyond the length of the corresponding array.
+pub fn interleave_ranges(
+    values: &[&dyn Array],
+    ranges: &[(usize, Range<usize>)],
+) -> Result<ArrayRef, ArrowError> {
+    if values.is_empty() {
+        return Err(ArrowError::InvalidArgumentError(
+            "interleave_ranges requires input of at least one array".to_string(),
+        ));
+    }
+    let data_type = values[0].data_type();
+
+    for array in values.iter().skip(1) {
+        if array.data_type() != data_type {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "It is not possible to interleave arrays of different data types ({} and {})",
+                data_type,
+                array.data_type()
+            )));
+        }
+    }
+
+    if ranges.is_empty() {
+        return Ok(new_empty_array(data_type));
+    }
+
+    downcast_primitive! {
+        data_type => (primitive_ranges_helper, values, ranges, data_type),
+        DataType::Utf8 => interleave_bytes_ranges::<Utf8Type>(values, ranges),
+        DataType::LargeUtf8 => interleave_bytes_ranges::<LargeUtf8Type>(values, ranges),
+        DataType::Binary => interleave_bytes_ranges::<BinaryType>(values, ranges),
+        DataType::LargeBinary => interleave_bytes_ranges::<LargeBinaryType>(values, ranges),
+        DataType::BinaryView => interleave_views_ranges::<BinaryViewType>(values, ranges),
+        DataType::Utf8View => interleave_views_ranges::<StringViewType>(values, ranges),
+        DataType::Boolean => interleave_boolean_ranges(values, ranges),
+        DataType::Struct(fields) => interleave_struct_ranges(fields, values, ranges),
+        DataType::List(field) => interleave_list_ranges::<i32>(values, ranges, field),
+        DataType::LargeList(field) => interleave_list_ranges::<i64>(values, ranges, field),
+        // dict, fixed-size list, union, run-end-encoded, etc. go through MutableArrayData
+        _ => interleave_fallback_ranges(values, ranges)
+    }
+}
+
+fn interleave_primitive_ranges<T: ArrowPrimitiveType>(
+    values: &[&dyn Array],
+    ranges: &[(usize, Range<usize>)],
+    data_type: &DataType,
+) -> Result<ArrayRef, ArrowError> {
+    let interleaved = InterleaveRanges::<'_, PrimitiveArray<T>>::new(values, ranges);
+    let arrays = &interleaved.arrays;
+
+    let mut output = Vec::with_capacity(interleaved.len);
+    for &(array_idx, ref range) in ranges {
+        if range.end - range.start == 1 {
+            output.push(arrays[array_idx].values()[range.start]);
+        } else {
+            output.extend_from_slice(&arrays[array_idx].values()[range.start..range.end]);
+        }
+    }
+
+    let array = PrimitiveArray::<T>::try_new(output.into(), interleaved.nulls)?;
+    Ok(Arc::new(array.with_data_type(data_type.clone())))
+}
+
+fn interleave_bytes_ranges<T: ByteArrayType>(
+    values: &[&dyn Array],
+    ranges: &[(usize, Range<usize>)],
+) -> Result<ArrayRef, ArrowError> {
+    let interleaved = InterleaveRanges::<'_, GenericByteArray<T>>::new(values, ranges);
+    let arrays = &interleaved.arrays;
+
+    let mut capacity = 0usize;
+    for &(array_idx, ref range) in ranges {
+        let o = arrays[array_idx].value_offsets();
+        capacity += o[range.end].as_usize() - o[range.start].as_usize();
+    }
+
+    let mut offset_acc = 0usize;
+    let mut offsets = Vec::with_capacity(interleaved.len + 1);
+    offsets.push(T::Offset::from_usize(0).unwrap());
+    for &(array_idx, ref range) in ranges {
+        let o = arrays[array_idx].value_offsets();
+        for i in range.start..range.end {
+            offset_acc += o[i + 1].as_usize() - o[i].as_usize();
+            offsets.push(
+                T::Offset::from_usize(offset_acc)
+                    .ok_or_else(|| ArrowError::OffsetOverflowError(offset_acc))?,
+            );
+        }
+    }
+
+    let mut values = Vec::with_capacity(capacity);
+    for &(array_idx, ref range) in ranges {
+        let arr = arrays[array_idx];
+        let src_offsets = arr.value_offsets();
+        let byte_start = src_offsets[range.start].as_usize();
+        let byte_end = src_offsets[range.end].as_usize();
+        values.extend_from_slice(&arr.value_data()[byte_start..byte_end]);
+    }
+
+    // Safety: safe by construction
+    let array = unsafe {
+        let offsets = OffsetBuffer::new_unchecked(offsets.into());
+        GenericByteArray::<T>::new_unchecked(offsets, values.into(), interleaved.nulls)
+    };
+    Ok(Arc::new(array))
+}
+
+fn interleave_views_ranges<T: ByteViewType>(
+    values: &[&dyn Array],
+    ranges: &[(usize, Range<usize>)],
+) -> Result<ArrayRef, ArrowError> {
+    let interleaved = InterleaveRanges::<'_, GenericByteViewArray<T>>::new(values, ranges);
+    let mut buffers = Vec::new();
+
+    let mut buf_offsets = Vec::with_capacity(interleaved.arrays.len() + 1);
+    buf_offsets.push(0);
+    let mut total_buffers = 0;
+    for a in interleaved.arrays.iter() {
+        total_buffers += a.data_buffers().len();
+        buf_offsets.push(total_buffers);
+    }
+
+    let mut buffer_to_new_index = vec![None; total_buffers];
+
+    let mut views = Vec::with_capacity(interleaved.len);
+    for &(array_idx, ref range) in ranges {
+        let array = interleaved.arrays[array_idx];
+        let src_views = array.views();
+        let run_start = views.len();
+        views.extend_from_slice(&src_views[range.start..range.end]);
+        if array.data_buffers().is_empty() {
+            // all views are inline, no buffer index patching needed
+            continue;
+        }
+        for view_raw in &mut views[run_start..] {
+            let view_len = *view_raw as u32;
+            if view_len <= 12 {
+                continue;
+            }
+            let view = ByteView::from(*view_raw);
+            let idx = buf_offsets[array_idx] + view.buffer_index as usize;
+            let new_idx: u32 = *buffer_to_new_index[idx].get_or_insert_with(|| {
+                buffers.push(array.data_buffers()[view.buffer_index as usize].clone());
+                (buffers.len() - 1) as u32
+            });
+            *view_raw = view.with_buffer_index(new_idx).as_u128();
+        }
+    }
+
+    // safety: views are copied from valid source arrays with buffer indices remapped
+    // to point into `buffers`, which contains the corresponding source buffers
+    let array = unsafe {
+        GenericByteViewArray::<T>::new_unchecked(views.into(), buffers, interleaved.nulls)
+    };
+    Ok(Arc::new(array))
+}
+
+fn interleave_boolean_ranges(
+    values: &[&dyn Array],
+    ranges: &[(usize, Range<usize>)],
+) -> Result<ArrayRef, ArrowError> {
+    let interleaved = InterleaveRanges::<'_, BooleanArray>::new(values, ranges);
+    let arrays = &interleaved.arrays;
+
+    let mut builder = BooleanBufferBuilder::new(interleaved.len);
+    for &(array_idx, ref range) in ranges {
+        let arr = arrays[array_idx];
+        let values_buf = arr.values();
+        builder.append_packed_range(
+            values_buf.offset() + range.start..values_buf.offset() + range.end,
+            values_buf.values(),
+        );
+    }
+
+    let array = BooleanArray::new(builder.finish(), interleaved.nulls);
+    Ok(Arc::new(array))
+}
+
+fn interleave_struct_ranges(
+    fields: &Fields,
+    values: &[&dyn Array],
+    ranges: &[(usize, Range<usize>)],
+) -> Result<ArrayRef, ArrowError> {
+    let interleaved = InterleaveRanges::<'_, StructArray>::new(values, ranges);
+
+    if fields.is_empty() {
+        let array = StructArray::try_new_with_length(
+            fields.clone(),
+            vec![],
+            interleaved.nulls,
+            interleaved.len,
+        )?;
+        return Ok(Arc::new(array));
+    }
+
+    let struct_fields_array: Result<Vec<_>, _> = (0..fields.len())
+        .map(|i| {
+            let field_values: Vec<&dyn Array> = interleaved
+                .arrays
+                .iter()
+                .map(|x| x.column(i).as_ref())
+                .collect();
+            interleave_ranges(&field_values, ranges)
+        })
+        .collect();
+
+    let struct_array =
+        StructArray::try_new(fields.clone(), struct_fields_array?, interleaved.nulls)?;
+    Ok(Arc::new(struct_array))
+}
+
+fn interleave_list_ranges<O: OffsetSizeTrait>(
+    values: &[&dyn Array],
+    ranges: &[(usize, Range<usize>)],
+    field: &FieldRef,
+) -> Result<ArrayRef, ArrowError> {
+    let interleaved = InterleaveRanges::<'_, GenericListArray<O>>::new(values, ranges);
+
+    let mut child_ranges = Vec::with_capacity(ranges.len());
+    let mut offset_acc = 0usize;
+    let mut offsets = Vec::with_capacity(interleaved.len + 1);
+    offsets.push(O::from_usize(0).unwrap());
+
+    for &(array_idx, ref range) in ranges {
+        let o = interleaved.arrays[array_idx].value_offsets();
+        let child_start = o[range.start].as_usize();
+        let child_end = o[range.end].as_usize();
+        if child_start < child_end {
+            child_ranges.push((array_idx, child_start..child_end));
+        }
+
+        for i in range.start..range.end {
+            offset_acc += o[i + 1].as_usize() - o[i].as_usize();
+            offsets.push(
+                O::from_usize(offset_acc)
+                    .ok_or_else(|| ArrowError::OffsetOverflowError(offset_acc))?,
+            );
+        }
+    }
+
+    let child_arrays: Vec<&dyn Array> = interleaved
+        .arrays
+        .iter()
+        .map(|list| list.values().as_ref())
+        .collect();
+
+    let interleaved_values = interleave_ranges(&child_arrays, &child_ranges)?;
+
+    let offsets = OffsetBuffer::new(offsets.into());
+    let list_array = GenericListArray::<O>::new(
+        field.clone(),
+        offsets,
+        interleaved_values,
+        interleaved.nulls,
+    );
+
+    Ok(Arc::new(list_array))
+}
+
+fn interleave_fallback_ranges(
+    values: &[&dyn Array],
+    ranges: &[(usize, Range<usize>)],
+) -> Result<ArrayRef, ArrowError> {
+    let arrays: Vec<_> = values.iter().map(|x| x.to_data()).collect();
+    let arrays: Vec<_> = arrays.iter().collect();
+    let len: usize = ranges.iter().map(|(_, r)| r.len()).sum();
+    let mut array_data = MutableArrayData::new(arrays, false, len);
+
+    for &(array_idx, ref range) in ranges {
+        array_data.extend(array_idx, range.start, range.end);
+    }
+
+    Ok(make_array(array_data.freeze()))
+}
+
+/// Interleave row ranges from multiple [`RecordBatch`] instances and return a new [`RecordBatch`].
+///
+/// This function will call [`interleave_ranges`] on each array of the [`RecordBatch`] instances and assemble a new [`RecordBatch`].
+///
+/// # Example
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{StringArray, Int32Array, RecordBatch};
+/// # use arrow_schema::{DataType, Field, Schema};
+/// # use arrow_select::interleave::interleave_ranges_record_batch;
+///
+/// let schema = Arc::new(Schema::new(vec![
+///     Field::new("a", DataType::Int32, true),
+///     Field::new("b", DataType::Utf8, true),
+/// ]));
+///
+/// let batch1 = RecordBatch::try_new(
+///     schema.clone(),
+///     vec![
+///         Arc::new(Int32Array::from(vec![0, 1, 2])),
+///         Arc::new(StringArray::from(vec!["a", "b", "c"])),
+///     ],
+/// ).unwrap();
+///
+/// let batch2 = RecordBatch::try_new(
+///     schema.clone(),
+///     vec![
+///         Arc::new(Int32Array::from(vec![3, 4, 5])),
+///         Arc::new(StringArray::from(vec!["d", "e", "f"])),
+///     ],
+/// ).unwrap();
+///
+/// let ranges = vec![(0, 1..3), (1, 0..2)];
+/// let result = interleave_ranges_record_batch(&[&batch1, &batch2], &ranges).unwrap();
+///
+/// let expected = RecordBatch::try_new(
+///     schema,
+///     vec![
+///         Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+///         Arc::new(StringArray::from(vec!["b", "c", "d", "e"])),
+///     ],
+/// ).unwrap();
+/// assert_eq!(result, expected);
+/// ```
+pub fn interleave_ranges_record_batch(
+    record_batches: &[&RecordBatch],
+    ranges: &[(usize, Range<usize>)],
+) -> Result<RecordBatch, ArrowError> {
+    let schema = record_batches[0].schema();
+    let columns = (0..schema.fields().len())
+        .map(|i| {
+            let column_values: Vec<&dyn Array> = record_batches
+                .iter()
+                .map(|batch| batch.column(i).as_ref())
+                .collect();
+            interleave_ranges(&column_values, ranges)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(schema, columns)
 }
 
 /// Interleave rows by index from multiple [`RecordBatch`] instances and return a new [`RecordBatch`].
@@ -1543,5 +1977,379 @@ mod tests {
             result_lv.value(2).as_primitive::<Int64Type>().values(),
             &[3]
         );
+    }
+
+    #[test]
+    fn test_ranges_primitive() {
+        let a = Int32Array::from_iter_values([1, 2, 3, 4]);
+        let b = Int32Array::from_iter_values([5, 6, 7]);
+        let values = interleave_ranges(&[&a, &b], &[(0, 0..3), (1, 0..2)]).unwrap();
+        let v = values.as_primitive::<Int32Type>();
+        assert_eq!(v.values(), &[1, 2, 3, 5, 6]);
+    }
+
+    #[test]
+    fn test_ranges_primitive_singleton() {
+        let a = Int32Array::from_iter_values([1, 2, 3, 4]);
+        let b = Int32Array::from_iter_values([5, 6, 7]);
+        let values = interleave_ranges(&[&a, &b], &[(0, 0..1), (1, 2..3), (0, 3..4)]).unwrap();
+        let v = values.as_primitive::<Int32Type>();
+        assert_eq!(v.values(), &[1, 7, 4]);
+    }
+
+    #[test]
+    fn test_ranges_primitive_with_nulls() {
+        let a = Int32Array::from_iter([Some(1), None, Some(3), Some(4)]);
+        let b = Int32Array::from_iter([Some(5), Some(6), None]);
+        let values = interleave_ranges(&[&a, &b], &[(0, 0..4), (1, 0..3)]).unwrap();
+        let v: Vec<_> = values.as_primitive::<Int32Type>().into_iter().collect();
+        assert_eq!(
+            &v,
+            &[Some(1), None, Some(3), Some(4), Some(5), Some(6), None]
+        );
+    }
+
+    #[test]
+    fn test_ranges_strings() {
+        let a = StringArray::from_iter_values(["a", "bb", "ccc"]);
+        let b = StringArray::from_iter_values(["hello", "world"]);
+        let values = interleave_ranges(&[&a, &b], &[(0, 0..3), (1, 0..2)]).unwrap();
+        let v = values.as_string::<i32>();
+        let collected: Vec<_> = v.into_iter().collect();
+        assert_eq!(
+            &collected,
+            &[
+                Some("a"),
+                Some("bb"),
+                Some("ccc"),
+                Some("hello"),
+                Some("world")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ranges_views() {
+        let a = StringViewArray::from(vec!["short", "a_longer_string_not_inlined", "med"]);
+        let b = StringViewArray::from(vec!["another_long_non_inline_string", "x"]);
+        let values = interleave_ranges(&[&a, &b], &[(0, 0..3), (1, 0..2)]).unwrap();
+        let v = values.as_string_view();
+        let collected: Vec<_> = v.iter().map(|x| x.unwrap().to_string()).collect();
+        assert_eq!(
+            collected,
+            vec![
+                "short",
+                "a_longer_string_not_inlined",
+                "med",
+                "another_long_non_inline_string",
+                "x",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ranges_empty() {
+        let a = Int32Array::from_iter_values([1, 2, 3]);
+        let values = interleave_ranges(&[&a], &[]).unwrap();
+        assert_eq!(values.len(), 0);
+    }
+
+    #[test]
+    fn test_ranges_dict_fallback() {
+        let a: DictionaryArray<Int8Type> = vec!["a", "b", "c"].into_iter().collect();
+        let b: DictionaryArray<Int8Type> = vec!["d", "e"].into_iter().collect();
+        let values: Vec<&dyn Array> = vec![&a, &b];
+        let result = interleave_ranges(&values, &[(0, 0..2), (1, 0..2)]).unwrap();
+        let dict = result.as_dictionary::<Int8Type>();
+        let strings: Vec<_> = dict
+            .downcast_dict::<StringArray>()
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(strings, vec![Some("a"), Some("b"), Some("d"), Some("e")]);
+    }
+
+    #[test]
+    fn test_ranges_boolean() {
+        let a = BooleanArray::from(vec![true, false, true, true]);
+        let b = BooleanArray::from(vec![false, true, false]);
+        let result = interleave_ranges(&[&a, &b], &[(0, 1..3), (1, 0..2)]).unwrap();
+        let v = result.as_boolean();
+        let collected: Vec<_> = v.iter().collect();
+        assert_eq!(
+            collected,
+            vec![Some(false), Some(true), Some(false), Some(true)]
+        );
+    }
+
+    #[test]
+    fn test_ranges_boolean_with_nulls() {
+        let a = BooleanArray::from(vec![Some(true), None, Some(false)]);
+        let b = BooleanArray::from(vec![Some(false), Some(true)]);
+        let result = interleave_ranges(&[&a, &b], &[(0, 0..3), (1, 0..2)]).unwrap();
+        let v: Vec<_> = result.as_boolean().iter().collect();
+        assert_eq!(
+            v,
+            vec![Some(true), None, Some(false), Some(false), Some(true)]
+        );
+    }
+
+    #[test]
+    fn test_ranges_struct() {
+        let a = StructArray::new(
+            Fields::from(vec![Field::new("x", DataType::Int32, false)]),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            None,
+        );
+        let b = StructArray::new(
+            Fields::from(vec![Field::new("x", DataType::Int32, false)]),
+            vec![Arc::new(Int32Array::from(vec![4, 5]))],
+            None,
+        );
+        let result = interleave_ranges(&[&a as &dyn Array, &b], &[(0, 0..2), (1, 0..2)]).unwrap();
+        let s = result.as_struct();
+        let col = s.column(0).as_primitive::<Int32Type>();
+        assert_eq!(col.values(), &[1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn test_ranges_list() {
+        let a = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3)]),
+            Some(vec![Some(4), Some(5), Some(6)]),
+        ]);
+        let b = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(7), Some(8)]),
+            Some(vec![Some(9)]),
+        ]);
+        let result = interleave_ranges(&[&a as &dyn Array, &b], &[(0, 0..2), (1, 0..2)]).unwrap();
+        let list = result.as_list::<i32>();
+        assert_eq!(list.len(), 4);
+        let vals: Vec<_> = (0..list.len())
+            .flat_map(|i| list.value(i).as_primitive::<Int32Type>().values().to_vec())
+            .collect();
+        assert_eq!(vals, vec![1, 2, 3, 7, 8, 9]);
+    }
+
+    /// verify that interleave_ranges produces identical output to interleave
+    /// for the same logical selection
+    #[test]
+    fn test_ranges_equivalence() {
+        fn ranges_to_indices(ranges: &[(usize, std::ops::Range<usize>)]) -> Vec<(usize, usize)> {
+            ranges
+                .iter()
+                .flat_map(|(a, r)| r.clone().map(move |row| (*a, row)))
+                .collect()
+        }
+
+        fn assert_equivalent(
+            label: &str,
+            arrays: &[&dyn Array],
+            ranges: &[(usize, std::ops::Range<usize>)],
+        ) {
+            let indices = ranges_to_indices(ranges);
+            let from_ranges = interleave_ranges(arrays, ranges).unwrap();
+            let from_indices = interleave(arrays, &indices).unwrap();
+            assert_eq!(
+                from_ranges.as_ref(),
+                from_indices.as_ref(),
+                "{label}: ranges and indices produced different results"
+            );
+        }
+
+        let ranges = vec![(0, 0..2), (1, 1..3), (0, 2..3)];
+
+        // primitive
+        let a = Int32Array::from(vec![Some(1), None, Some(3), Some(4)]);
+        let b = Int32Array::from(vec![Some(5), Some(6), None, Some(8)]);
+        assert_equivalent("i32", &[&a, &b], &ranges);
+
+        // boolean
+        let a = BooleanArray::from(vec![Some(true), None, Some(false), Some(true)]);
+        let b = BooleanArray::from(vec![Some(false), Some(true), None, Some(false)]);
+        assert_equivalent("bool", &[&a, &b], &ranges);
+
+        // string
+        let a = StringArray::from(vec![Some("a"), None, Some("c"), Some("d")]);
+        let b = StringArray::from(vec![Some("e"), Some("f"), None, Some("h")]);
+        assert_equivalent("string", &[&a, &b], &ranges);
+
+        // string view
+        let a = StringViewArray::from(vec![
+            Some("short"),
+            None,
+            Some("a_longer_string_not_inlined"),
+        ]);
+        let b = StringViewArray::from(vec![
+            Some("x"),
+            Some("another_long_non_inline_string"),
+            None,
+        ]);
+        assert_equivalent("string_view", &[&a, &b], &ranges);
+
+        // struct
+        let make_struct = |vals: Vec<Option<i32>>| -> StructArray {
+            let ints = Int32Array::from(vals);
+            StructArray::new(
+                Fields::from(vec![Field::new("v", DataType::Int32, true)]),
+                vec![Arc::new(ints)],
+                None,
+            )
+        };
+        let a = make_struct(vec![Some(1), None, Some(3), Some(4)]);
+        let b = make_struct(vec![Some(5), Some(6), None, Some(8)]);
+        assert_equivalent("struct", &[&a, &b], &ranges);
+
+        // list
+        let a = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            Some(vec![Some(2), Some(3)]),
+            Some(vec![]),
+            Some(vec![Some(4)]),
+        ]);
+        let b = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(5), Some(6)]),
+            Some(vec![Some(7)]),
+            Some(vec![Some(8), Some(9)]),
+            Some(vec![]),
+        ]);
+        assert_equivalent("list", &[&a, &b], &ranges);
+
+        // dict (goes through fallback)
+        let a: DictionaryArray<Int8Type> = vec!["a", "b", "c", "d"].into_iter().collect();
+        let b: DictionaryArray<Int8Type> = vec!["e", "f", "g", "h"].into_iter().collect();
+        assert_equivalent("dict", &[&a, &b], &ranges);
+    }
+
+    #[test]
+    fn test_ranges_sliced_inputs() {
+        // sliced primitive arrays have offset into the values buffer
+        let full_a = Int32Array::from(vec![Some(0), Some(1), None, Some(3), Some(4)]);
+        let full_b = Int32Array::from(vec![Some(10), Some(20), Some(30), None]);
+        let a = full_a.slice(1, 4); // [1, None, 3, 4]
+        let b = full_b.slice(1, 3); // [20, 30, None]
+
+        let result = interleave_ranges(&[&a, &b], &[(0, 0..2), (1, 0..2)]).unwrap();
+        let v: Vec<_> = result.as_primitive::<Int32Type>().into_iter().collect();
+        assert_eq!(v, vec![Some(1), None, Some(20), Some(30)]);
+
+        // sliced string arrays have offset into byte/offset buffers
+        let full_s = StringArray::from(vec![Some("x"), Some("hello"), Some("world"), None]);
+        let s = full_s.slice(1, 3); // ["hello", "world", None]
+        let result2 = interleave_ranges(&[&s], &[(0, 0..3)]).unwrap();
+        let v: Vec<_> = result2.as_string::<i32>().into_iter().collect();
+        assert_eq!(v, vec![Some("hello"), Some("world"), None]);
+
+        // sliced boolean arrays have bit offset
+        let full_bool =
+            BooleanArray::from(vec![Some(true), None, Some(false), Some(true), Some(false)]);
+        let sliced = full_bool.slice(1, 4); // [None, false, true, false]
+        let result3 = interleave_ranges(&[&sliced], &[(0, 0..4)]).unwrap();
+        let v: Vec<_> = result3.as_boolean().iter().collect();
+        assert_eq!(v, vec![None, Some(false), Some(true), Some(false)]);
+
+        // sliced list arrays have offset into child value offsets
+        let full_list = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            Some(vec![Some(2), Some(3)]),
+            Some(vec![Some(4)]),
+            Some(vec![Some(5), Some(6), Some(7)]),
+        ]);
+        let list = full_list.slice(1, 3); // [[2,3], [4], [5,6,7]]
+        let result4 = interleave_ranges(&[&list], &[(0, 0..2)]).unwrap();
+        let v: Vec<_> = (0..result4.as_list::<i32>().len())
+            .flat_map(|i| {
+                result4
+                    .as_list::<i32>()
+                    .value(i)
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(v, vec![2, 3, 4]);
+
+        // sliced struct arrays propagate slices to child columns
+        let full_struct = StructArray::new(
+            Fields::from(vec![Field::new("x", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(10),
+                None,
+                Some(30),
+                Some(40),
+            ]))],
+            None,
+        );
+        let s = full_struct.slice(1, 3); // [None, 30, 40]
+        let result5 = interleave_ranges(&[&s], &[(0, 0..3)]).unwrap();
+        let col = result5.as_struct().column(0).as_primitive::<Int32Type>();
+        let v: Vec<_> = col.into_iter().collect();
+        assert_eq!(v, vec![None, Some(30), Some(40)]);
+    }
+
+    #[test]
+    fn test_ranges_overlapping() {
+        let a = Int32Array::from_iter_values([10, 20, 30, 40, 50]);
+        let result = interleave_ranges(&[&a], &[(0, 0..3), (0, 1..4)]).unwrap();
+        let v = result.as_primitive::<Int32Type>();
+        assert_eq!(v.values(), &[10, 20, 30, 20, 30, 40]);
+    }
+
+    #[test]
+    fn test_ranges_list_with_empty_elements() {
+        // exercises the empty child range filter in interleave_list_ranges
+        let a = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![]),
+            Some(vec![Some(3)]),
+        ]);
+        let b = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![]),
+            Some(vec![Some(4)]),
+        ]);
+        let result = interleave_ranges(&[&a as &dyn Array, &b], &[(0, 1..3), (1, 0..2)]).unwrap();
+        let list = result.as_list::<i32>();
+        assert_eq!(list.len(), 4);
+        let vals: Vec<_> = (0..list.len())
+            .map(|i| list.value(i).as_primitive::<Int32Type>().values().to_vec())
+            .collect();
+        assert_eq!(vals, vec![vec![], vec![3], vec![], vec![4]]);
+    }
+
+    #[test]
+    fn test_ranges_record_batch() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4, 5])),
+                Arc::new(StringArray::from(vec!["d", "e", "f"])),
+            ],
+        )
+        .unwrap();
+
+        let result =
+            interleave_ranges_record_batch(&[&batch1, &batch2], &[(0, 1..3), (1, 0..2)]).unwrap();
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["b", "c", "d", "e"])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, expected);
     }
 }
