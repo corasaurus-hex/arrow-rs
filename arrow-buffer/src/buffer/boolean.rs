@@ -505,7 +505,11 @@ impl BooleanBuffer {
         unsafe { bit_util::get_bit_raw(self.buffer.as_ptr(), i + self.bit_offset) }
     }
 
-    /// Returns the packed values of this [`BooleanBuffer`] not including any offset
+    /// Returns the raw packed bytes of this [`BooleanBuffer`].
+    ///
+    /// The returned slice contains the entire underlying byte buffer.
+    /// Use [`Self::offset()`] to determine the starting bit position
+    /// of this buffer's data within the returned bytes.
     #[inline]
     pub fn values(&self) -> &[u8] {
         &self.buffer
